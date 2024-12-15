@@ -1,0 +1,273 @@
+Description: CD12352 - Infrastructure as Code Project - Udagram
+
+Parameters:
+
+  EnvironmentName:
+      Description: This is the network for the high availability web application
+      Type: String
+
+Resources:
+  # NewKeyPair:
+  #   Type: 'AWS::EC2::KeyPair'
+  #   Properties:
+  #     KeyName: MyKeyPair
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http access to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-vpc-id"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http access to our hosts from the LB Security Group
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-vpc-id"
+
+      GroupDescription: Allow SSH access
+
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        SourceSecurityGroupId: !Ref LBSecGroup
+
+      # Add the following item to allow SSH access from the bastion host
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        SourceSecurityGroupId: !Ref BastionSecurityGroup
+
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+
+  WebAppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties: 
+      LaunchTemplateData:
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            # Update the package index and install Nginx
+            apt-get update -y
+            apt-get install nginx -y
+            service nginx start
+
+            # Create a basic index.html file directly in the Nginx web directory
+            cat <<EOF > /var/www/html/index.html
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <title>It works! Udagram, Udacity</title>
+            </head>
+            <body>
+              <h1>It works! Udagram, Udacity</h1>
+              <p>This website is hosted on Nginx.</p>
+            </body>
+            </html>
+            EOF
+
+            # Reload Nginx to apply the changes
+            systemctl reload nginx
+
+            # Install OpenSSH server
+            apt-get install -y openssh-server
+
+        ImageId: ami-0e2c8caa4b6378d8c
+        SecurityGroupIds:
+          - !Ref WebServerSecGroup
+        InstanceType: t2.micro
+        BlockDeviceMappings:
+          - DeviceName: "/dev/sdk"
+            Ebs:
+              VolumeSize: '10'
+        IamInstanceProfile:
+          Name: !Ref WebAppInstanceProfile
+        KeyName: MyKeyPair
+
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvironmentName}-bucket-jilo12"
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  WebAppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-web-servers"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: 'Allow'
+          Principal:
+            Service:
+            - 'ec2.amazonaws.com'
+          Action:
+          - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: s3
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - s3:DeleteObject
+              - s3:ListBucket
+              Resource:
+              # - !Sub "arn:aws:s3:::${EnvironmentName}-bucket-jilo12/*"
+              - !GetAtt S3Bucket.Arn
+              # ManagedPolicyArns:
+              # - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  WebAppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles:
+      - !Ref WebAppInstanceRole
+
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebAppLaunchTemplate
+        Version: !GetAtt WebAppLaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '3'
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: '80'
+      Protocol: HTTP
+
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-vpc-id"
+
+  Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro  # Adjust as needed
+      KeyName: MyKeyPair
+      ImageId: ami-0e2c8caa4b6378d8c
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      SubnetId:
+        Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          sudo apt-get update -y
+          sudo apt-get install -y openssh-server
+          # KEY_NAME= "MyKeyPair"
+
+      Tags:
+        - Key: Name
+          Value: "Bastion Host"
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH access to the bastion host
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-vpc-id"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+        # Replace 0.0.0.0/0 with specific IP ranges or security group IDs
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  BastionHostIP:
+    Description: The Public Ip
+    Value: !GetAtt Bastion.PublicIp
+  BastionHostIPPrivate:
+    Description: The Private Ip
+    Value: !GetAtt Bastion.PrivateIp
+
+  LoadBalancerDNS:
+    Description: The DNS name of the load balancer.
+    Value: !Sub "http://${WebAppLB.DNSName}"
+  
+  ConnectionCMD:
+    Value:
+      !Join [
+        "",
+        [
+          ssh -A -i ./MyKeyPair.pem ubuntu@,
+          !GetAtt Bastion.PublicIp,
+          " "
+        ],
+      ]
